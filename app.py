@@ -6,6 +6,80 @@ from PIL import Image
 import json
 import io
 import torch.nn as nn
+import requests
+from functools import lru_cache
+import os
+from waste_guide_data import WASTE_PROCESSING_GUIDE
+from dotenv import load_dotenv
+import os
+from openai import OpenAI
+import json
+
+# Load variables from .env file
+load_dotenv()
+
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY') 
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+@lru_cache(maxsize=100)
+def generate_waste_guide_with_ai(waste_type_vn, waste_type_en):
+    """
+    Tạo hướng dẫn xử lý rác chi tiết từ dữ liệu cứng nếu có, nếu không thì gọi API OpenAI.
+    """
+    # Nếu có hướng dẫn sẵn -> trả về luôn
+    if waste_type_en in WASTE_PROCESSING_GUIDE:
+        return {**WASTE_PROCESSING_GUIDE[waste_type_en], 'generated_by': 'static_data'}
+
+    # Nếu không có thì gọi AI
+    try:
+        prompt = f"""
+        Bạn là chuyên gia về quản lý chất thải và môi trường. Hãy tạo hướng dẫn chi tiết 
+        về cách xử lý loại rác: {waste_type_vn} ({waste_type_en}).
+
+        Hãy trả lời theo định dạng JSON với các thông tin sau:
+        - category
+        - disposal_method
+        - preparation
+        - recycling_process
+        - environmental_impact
+        - tips
+        - alternatives
+
+        Trả lời bằng tiếng Việt, phù hợp với điều kiện Việt Nam.
+        """
+
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "Bạn là chuyên gia môi trường, trả lời bằng JSON hợp lệ."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=800
+        )
+
+        guide_text = response.choices[0].message.content
+        if guide_text.startswith('```json'):
+            guide_text = guide_text.replace('```json', '').replace('```', '')
+        
+        guide_data = json.loads(guide_text.strip())
+        guide_data['generated_by'] = 'openai'
+        return guide_data
+
+    except Exception as e:
+        return {
+            "category": "Cần phân loại",
+            "disposal_method": "Tham khảo hướng dẫn địa phương",
+            "preparation": ["Liên hệ cơ quan môi trường để được hướng dẫn"],
+            "recycling_process": "Đang cập nhật thông tin",
+            "environmental_impact": "Cần xử lý đúng cách để bảo vệ môi trường",
+            "tips": ["Luôn phân loại rác đúng cách"],
+            "alternatives": ["Tìm hiểu các sản phẩm thay thế thân thiện môi trường"],
+            "generated_by": "fallback",
+            "error": f"Lỗi AI API: {str(e)}"
+        }
+
 
 app = Flask(__name__)
 
@@ -123,10 +197,74 @@ def predict():
     
     predicted_class = label_mapping[str(pred)]
     
+    # Extract parent class (first number in the label)
+    parent_class = predicted_class.split('_')[0]
+    
+    # Extract name without number prefix
+    name_parts = predicted_class.split('_')[1:]
+    prediction = "_".join(name_parts)
+    
+    # Vietnamese translation mapping
+    vietnamese_mapping = {
+        "Paper_box": "Hộp giấy",
+        "Paper_other": "Giấy khác",
+        "Plastic_box": "Hộp nhựa",
+        "Plastic_cups": "Cốc nhựa",
+        "Metal_package": "Bao bì kim loại",
+        "Metal_other": "Kim loại khác",
+        "Glass_bottle": "Chai thủy tinh",
+        "Glass_other": "Thủy tinh vỡ",
+        "Fabric_leather": "Vải và da",
+        "Wood_household": "Đồ gỗ gia dụng",
+        "Rubber_toy": "Đồ chơi cao su",
+        "Rubber_other": "Cao su khác",
+        "Electrical_small": "Thiết bị điện nhỏ",
+        "Electrical_large": "Thiết bị điện lớn",
+        "Food_leftover": "Thức ăn thừa",
+        "Food_other": "Thực phẩm khác",
+        "Hazardous_other": "Chất độc hại khác",
+        "Hazardous_medical": "Chất độc hại y tế",
+        "Hazardous_light": "Đèn độc hại",
+        "Hazardous_battery": "Pin độc hại",
+        "Bulky_wood": "Gỗ cồng kềnh",
+        "Other_house_organic": "Chất hữu cơ gia đình khác",
+        "Other_household": "Đồ gia dụng khác",
+        "Other_plastic": "Nhựa khác"
+    }
+    
+    prediction_vn = vietnamese_mapping.get(prediction, "Chưa có bản dịch")
+    
+    ai_guide = generate_waste_guide_with_ai(prediction_vn, prediction)
+    
+    
     return jsonify({
-        'prediction': predicted_class,
-        'class_id': pred
+        'prediction': prediction,
+        'parent_class': parent_class,
+        'prediction_vn': prediction_vn,
+        'class_id': pred,
+        'processing_guide': ai_guide,
+        'generated_by_ai': True
     })
+
+@app.route('/regenerate-guide', methods=['POST'])
+def regenerate_guide():
+    data = request.get_json()
+    waste_type_vn = data.get('waste_type_vn')
+    waste_type_en = data.get('waste_type_en')
+    
+    if not waste_type_vn or not waste_type_en:
+        return jsonify({'error': 'Thiếu thông tin loại rác'}), 400
+    
+    # Clear cache và tạo hướng dẫn mới
+    generate_waste_guide_with_ai.cache_clear()
+    new_guide = generate_waste_guide_with_ai(waste_type_vn, waste_type_en)
+    
+    return jsonify({
+        'waste_type_vn': waste_type_vn,
+        'waste_type_en': waste_type_en,
+        'guide': new_guide
+    })
+    
 
 @app.route('/', methods=['GET'])
 def index():
