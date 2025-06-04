@@ -158,14 +158,25 @@ label_mapping = None
 
 def init_app():
     global model, label_mapping
-    model = get_model('densenet169', num_classes)
-    model.load_state_dict(torch.load("models/densenet169.pth", map_location=device))
+    model_name = 'densenet201'
+    model = get_model(model_name, num_classes)
+    # get path model
+    model_path = os.path.join(os.path.dirname(__file__), 'models', f'{model_name}.pth')
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file {model_path} not found. Please ensure the model is downloaded and placed in the correct directory.")
+    
+    model.load_state_dict(torch.load(model_path, map_location=device))
     model.to(device)
     model.eval()
     
-    with open('label_mapping.json', 'r', encoding='utf-8') as f:
-        label_mapping = json.load(f)
-
+    if model_name == 'densenet201':
+        with open('label_mapping_densenet.json', 'r', encoding='utf-8') as f:
+            label_mapping = json.load(f)
+    else:
+        with open('label_mapping.json', 'r', encoding='utf-8') as f:
+            label_mapping = json.load(f)
+            
+            
 # Đảm bảo model được load trước khi xử lý request
 @app.before_request
 def load_model_if_needed():
