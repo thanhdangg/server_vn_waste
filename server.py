@@ -276,12 +276,18 @@ async def predict(image: UploadFile = File(...)):
     
     prediction_vn = vietnamese_mapping.get(prediction, "Chưa có bản dịch")
     
+    # Generate AI guide directly in the prediction endpoint
+    ai_guide = generate_waste_guide_with_ai(prediction_vn, prediction)
+    
+    
     # Return immediate prediction response with a unique request ID
     return {
         'prediction': prediction,
         'parent_class': parent_class,
         'prediction_vn': prediction_vn,
         'class_id': pred,
+        'processing_guide': ai_guide,
+        'generated_by_ai': True,
         'request_id': str(uuid.uuid4())
     }
 
