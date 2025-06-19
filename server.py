@@ -1,4 +1,6 @@
-from flask import Flask, request, jsonify, current_app
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form, Body, Request
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 import torch
 import torchvision.models as models
 import torchvision.transforms as T
@@ -12,9 +14,11 @@ import os
 from waste_guide_data import WASTE_PROCESSING_GUIDE
 from trash_bin_location import TRASH_BIN_LOCATIONS
 from dotenv import load_dotenv
-import os
 from openai import OpenAI
 import json
+import uuid
+from pydantic import BaseModel
+from typing import Dict, List, Optional, Any, Union
 
 # Load variables from .env file
 load_dotenv()
@@ -81,8 +85,43 @@ def generate_waste_guide_with_ai(waste_type_vn, waste_type_en):
             "error": f"Lỗi AI API: {str(e)}"
         }
 
+# Định nghĩa các model Pydantic
+class GuideRequest(BaseModel):
+    waste_type_vn: str
+    waste_type_en: str
 
-app = Flask(__name__)
+class LocationBase(BaseModel):
+    id: str
+    name: str
+    description: str
+    latLng: Dict[str, float]
+    category: str
+
+class LocationResponse(LocationBase):
+    point: Dict[str, float]
+
+class PredictionResponse(BaseModel):
+    prediction: str
+    parent_class: str
+    prediction_vn: str
+    class_id: int
+    request_id: str
+
+class GuideResponse(BaseModel):
+    waste_type_vn: str
+    waste_type_en: str
+    processing_guide: Dict[str, Any]
+
+app = FastAPI(title="Waste Classification API", version="1.0.0")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Cấu hình
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -106,7 +145,6 @@ def get_model(name, num_classes):
         from torchvision.models import ResNet152_Weights
         model = models.resnet152(weights=ResNet152_Weights.DEFAULT)
         model.fc = nn.Linear(model.fc.in_features, num_classes)
-
     elif name == 'densenet121':
         from torchvision.models import DenseNet121_Weights
         model = models.densenet121(weights=DenseNet121_Weights.DEFAULT)
@@ -119,13 +157,10 @@ def get_model(name, num_classes):
         from torchvision.models import DenseNet201_Weights
         model = models.densenet201(weights=DenseNet201_Weights.DEFAULT)
         model.classifier = nn.Linear(model.classifier.in_features, num_classes)
-    
-        
     elif name == 'mobilenetv2':
         from torchvision.models import MobileNet_V2_Weights
         model = models.mobilenet_v2(weights=MobileNet_V2_Weights.DEFAULT)
         model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
-
     elif name == 'vgg16':
         from torchvision.models import VGG16_BN_Weights
         model = models.vgg16_bn(weights=VGG16_BN_Weights.DEFAULT)
@@ -146,7 +181,6 @@ def get_model(name, num_classes):
         from torchvision.models import EfficientNet_B7_Weights
         model = models.efficientnet_b7(weights=EfficientNet_B7_Weights.DEFAULT)
         model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
-        
     else:
         raise ValueError("Model not supported")
     return model
@@ -154,6 +188,41 @@ def get_model(name, num_classes):
 # Khởi tạo model và mapping
 model = None
 label_mapping = None
+
+# Vietnamese translation mapping
+vietnamese_mapping = {
+    "Paper_box": "Hộp giấy",
+    "Paper_other": "Giấy khác",
+    "Plastic_box": "Hộp nhựa",
+    "Plastic_cups": "Cốc nhựa",
+    "Metal_package": "Bao bì kim loại",
+    "Metal_other": "Kim loại khác",
+    "Glass_bottle": "Chai thủy tinh",
+    "Glass_other": "Thủy tinh vỡ",
+    "Fabric_leather": "Vải và da",
+    "Wood_household": "Đồ gỗ gia dụng",
+    "Rubber_toy": "Đồ chơi cao su",
+    "Rubber_other": "Cao su khác",
+    "Electrical_small": "Thiết bị điện nhỏ",
+    "Electrical_large": "Thiết bị điện lớn",
+    "Food_leftover": "Thức ăn thừa",
+    "Food_other": "Thực phẩm khác",
+    "Hazardous_other": "Chất độc hại khác",
+    "Hazardous_medical": "Chất độc hại y tế",
+    "Hazardous_light": "Đèn độc hại",
+    "Hazardous_battery": "Pin độc hại",
+    "Bulky_wood": "Gỗ cồng kềnh",
+    "Other_house_organic": "Chất hữu cơ gia đình khác",
+    "Other_household": "Đồ gia dụng khác",
+    "Other_plastic": "Nhựa khác"
+}
+
+# Định nghĩa transform
+transform = T.Compose([
+    T.Resize((256, 256)),
+    T.ToTensor(),
+    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
 
 def init_app():
     global model, label_mapping
@@ -174,29 +243,20 @@ def init_app():
     else:
         with open('label_mapping.json', 'r', encoding='utf-8') as f:
             label_mapping = json.load(f)
-            
-            
-# Đảm bảo model được load trước khi xử lý request
-@app.before_request
-def load_model_if_needed():
-    global model
-    if model is None:
-        init_app()
 
-# Định nghĩa transform
-transform = T.Compose([
-    T.Resize((256, 256)),
-    T.ToTensor(),
-    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
+# Initialize model on startup
+@app.on_event("startup")
+def startup_event():
+    init_app()
 
-@app.route('/predict', methods=['POST'])
-def predict():
-    if 'image' not in request.files:
-        return jsonify({'error': 'Không tìm thấy ảnh'}), 400
+@app.post("/predict")
+async def predict(image: UploadFile = File(...)):
+    # Check if file was uploaded
+    if not image:
+        raise HTTPException(status_code=400, detail="Không tìm thấy ảnh")
     
-    file = request.files['image']
-    img_bytes = file.read()
+    # Read and process the image
+    img_bytes = await image.read()
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     
     input_tensor = transform(img).unsqueeze(0).to(device)
@@ -214,70 +274,50 @@ def predict():
     name_parts = predicted_class.split('_')[1:]
     prediction = "_".join(name_parts)
     
-    # Vietnamese translation mapping
-    vietnamese_mapping = {
-        "Paper_box": "Hộp giấy",
-        "Paper_other": "Giấy khác",
-        "Plastic_box": "Hộp nhựa",
-        "Plastic_cups": "Cốc nhựa",
-        "Metal_package": "Bao bì kim loại",
-        "Metal_other": "Kim loại khác",
-        "Glass_bottle": "Chai thủy tinh",
-        "Glass_other": "Thủy tinh vỡ",
-        "Fabric_leather": "Vải và da",
-        "Wood_household": "Đồ gỗ gia dụng",
-        "Rubber_toy": "Đồ chơi cao su",
-        "Rubber_other": "Cao su khác",
-        "Electrical_small": "Thiết bị điện nhỏ",
-        "Electrical_large": "Thiết bị điện lớn",
-        "Food_leftover": "Thức ăn thừa",
-        "Food_other": "Thực phẩm khác",
-        "Hazardous_other": "Chất độc hại khác",
-        "Hazardous_medical": "Chất độc hại y tế",
-        "Hazardous_light": "Đèn độc hại",
-        "Hazardous_battery": "Pin độc hại",
-        "Bulky_wood": "Gỗ cồng kềnh",
-        "Other_house_organic": "Chất hữu cơ gia đình khác",
-        "Other_household": "Đồ gia dụng khác",
-        "Other_plastic": "Nhựa khác"
-    }
-    
     prediction_vn = vietnamese_mapping.get(prediction, "Chưa có bản dịch")
     
-    ai_guide = generate_waste_guide_with_ai(prediction_vn, prediction)
-    
-    
-    return jsonify({
+    # Return immediate prediction response with a unique request ID
+    return {
         'prediction': prediction,
         'parent_class': parent_class,
         'prediction_vn': prediction_vn,
         'class_id': pred,
-        'processing_guide': ai_guide,
-        'generated_by_ai': True
-    })
+        'request_id': str(uuid.uuid4())
+    }
 
-@app.route('/regenerate-guide', methods=['POST'])
-def regenerate_guide():
-    data = request.get_json()
-    waste_type_vn = data.get('waste_type_vn')
-    waste_type_en = data.get('waste_type_en')
+@app.get("/guide/{waste_type_en}")
+async def get_waste_guide(waste_type_en: str, waste_type_vn: str = None):
+    if not waste_type_vn:
+        waste_type_vn = vietnamese_mapping.get(waste_type_en, waste_type_en)
+        
+    ai_guide = generate_waste_guide_with_ai(waste_type_vn, waste_type_en)
+    
+    return {
+        'waste_type_en': waste_type_en,
+        'waste_type_vn': waste_type_vn,
+        'processing_guide': ai_guide
+    }
+
+@app.post("/regenerate-guide")
+async def regenerate_guide(request: GuideRequest):
+    waste_type_vn = request.waste_type_vn
+    waste_type_en = request.waste_type_en
     
     if not waste_type_vn or not waste_type_en:
-        return jsonify({'error': 'Thiếu thông tin loại rác'}), 400
+        raise HTTPException(status_code=400, detail="Thiếu thông tin loại rác")
     
     # Clear cache và tạo hướng dẫn mới
     generate_waste_guide_with_ai.cache_clear()
     new_guide = generate_waste_guide_with_ai(waste_type_vn, waste_type_en)
     
-    return jsonify({
+    return {
         'waste_type_vn': waste_type_vn,
         'waste_type_en': waste_type_en,
         'guide': new_guide
-    })
+    }
 
-
-@app.route('/locations', methods=['GET'])
-def get_all_locations():
+@app.get("/locations", response_model=List[LocationResponse])
+async def get_all_locations():
     """Get all trash bin locations"""
     # For each location, calculate the point from latLng
     locations = []
@@ -289,10 +329,10 @@ def get_all_locations():
         }
         locations.append(location)
         
-    return jsonify(locations)
+    return locations
 
-@app.route('/locations/category/<category>', methods=['GET'])
-def get_locations_by_category(category):
+@app.get("/locations/category/{category}", response_model=List[LocationResponse])
+async def get_locations_by_category(category: str):
     """Get trash bin locations by category"""
     filtered_locations = []
     for loc in TRASH_BIN_LOCATIONS:
@@ -304,10 +344,10 @@ def get_locations_by_category(category):
             }
             filtered_locations.append(location)
             
-    return jsonify(filtered_locations)
+    return filtered_locations
 
-@app.route('/locations/<location_id>', methods=['GET'])
-def get_location_by_id(location_id):
+@app.get("/locations/{location_id}", response_model=LocationResponse)
+async def get_location_by_id(location_id: str):
     """Get a specific trash bin location by ID"""
     for loc in TRASH_BIN_LOCATIONS:
         if loc["id"] == location_id:
@@ -316,42 +356,33 @@ def get_location_by_id(location_id):
                 "longitude": loc["latLng"]["longitude"],
                 "latitude": loc["latLng"]["latitude"]
             }
-            return jsonify(location)
+            return location
             
-    return jsonify({"error": "Location not found"}), 404
+    raise HTTPException(status_code=404, detail="Location not found")
 
-# Optional: Add a new location (would require authentication in production)
-@app.route('/locations', methods=['POST'])
-def add_location():
+@app.post("/locations", response_model=LocationResponse, status_code=201)
+async def add_location(location: LocationBase):
     """Add a new trash bin location"""
-    data = request.get_json()
-    
-    # Validate required fields
-    required_fields = ['id', 'name', 'description', 'latLng', 'category']
-    for field in required_fields:
-        if field not in data:
-            return jsonify({"error": f"Missing required field: {field}"}), 400
-            
     # Check if ID already exists
     for loc in TRASH_BIN_LOCATIONS:
-        if loc["id"] == data["id"]:
-            return jsonify({"error": "Location ID already exists"}), 400
+        if loc["id"] == location.id:
+            raise HTTPException(status_code=400, detail="Location ID already exists")
             
     # Add the new location
-    TRASH_BIN_LOCATIONS.append(data)
+    location_dict = location.dict()
+    TRASH_BIN_LOCATIONS.append(location_dict)
     
     # Return the created location with point calculated
-    location = data.copy()
-    location["point"] = {
-        "longitude": data["latLng"]["longitude"],
-        "latitude": data["latLng"]["latitude"]
+    response = location_dict.copy()
+    response["point"] = {
+        "longitude": location_dict["latLng"]["longitude"],
+        "latitude": location_dict["latLng"]["latitude"]
     }
     
-    return jsonify(location), 201
- 
+    return response
 
-@app.route('/', methods=['GET'])
-def index():
+@app.get("/", response_class=HTMLResponse)
+async def index():
     return """
     <html>
         <head>
@@ -367,8 +398,6 @@ def index():
     </html>
     """
 
-if __name__ == '__main__':
-    # Khởi tạo model và mapping khi khởi động ứng dụng
-    init_app()
-    app.run(debug=True, host='0.0.0.0', port=5002)
-    
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=5002)
