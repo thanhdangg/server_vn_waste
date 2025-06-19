@@ -19,7 +19,9 @@ import json
 import uuid
 from pydantic import BaseModel
 from typing import Dict, List, Optional, Any, Union
-
+import uuid
+from typing import Dict, List, Optional, Any, Union
+from datetime import datetime
 # Load variables from .env file
 load_dotenv()
 
@@ -113,6 +115,20 @@ class GuideResponse(BaseModel):
     processing_guide: Dict[str, Any]
 
 app = FastAPI(title="Waste Classification API", version="1.0.0")
+
+# Pydantic models for request/response validation
+class ChatRequest(BaseModel):
+    question: str
+    conversation_id: Optional[str] = None
+
+class ChatResponse(BaseModel):
+    answer: str
+    conversation_id: str
+    timestamp: str
+
+# Store conversation histories in memory
+conversation_histories = {}
+
 
 # Add CORS middleware
 app.add_middleware(
@@ -386,6 +402,83 @@ async def add_location(location: LocationBase):
     }
     
     return response
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_with_ai(request: ChatRequest):
+    """Xử lý câu hỏi từ người dùng thông qua ChatGPT API"""
+    try:
+        # Get conversation ID or create new one
+        conversation_id = request.conversation_id or str(uuid.uuid4())
+        
+        # Get or initialize conversation history
+        if conversation_id not in conversation_histories:
+            conversation_histories[conversation_id] = [
+                {"role": "system", "content": "Bạn là một trợ lý AI chuyên về phân loại và xử lý rác thải ở Việt Nam. Hãy áp dụng kiến thức từ các quy định của Pháp luật Việt Nam về phân loại và xử lý rác thải, Hãy trả lời bằng tiếng Việt, ngắn gọn và hữu ích. Khuyến khích người dùng áp dụng nguyên tắc 3R (Reduce-Reuse-Recycle) và cung cấp thông tin hữu ích về việc bảo vệ môi trường."}
+            ]
+        
+        # Add user question to history
+        conversation_histories[conversation_id].append({"role": "user", "content": request.question})
+        
+        # Call ChatGPT API with the conversation history
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=conversation_histories[conversation_id],
+            temperature=0.7,
+            max_tokens=800
+        )
+        
+        answer = response.choices[0].message.content
+        
+        # Add assistant response to history
+        conversation_histories[conversation_id].append({"role": "assistant", "content": answer})
+        
+        # Limit history length to prevent token limits
+        if len(conversation_histories[conversation_id]) > 10:
+            # Keep system message and last 9 exchanges
+            conversation_histories[conversation_id] = [
+                conversation_histories[conversation_id][0]
+            ] + conversation_histories[conversation_id][-9:]
+        
+        return {
+            "answer": answer,
+            "conversation_id": conversation_id,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Lỗi khi gọi API ChatGPT: {str(e)}"
+        )
+
+@app.delete("/chat/{conversation_id}")
+async def clear_chat_history(conversation_id: str):
+    """Xóa lịch sử cuộc trò chuyện"""
+    if conversation_id in conversation_histories:
+        del conversation_histories[conversation_id]
+        return {"status": "success", "message": "Đã xóa lịch sử cuộc trò chuyện"}
+    else:
+        raise HTTPException(
+            status_code=404,
+            detail="Không tìm thấy cuộc trò chuyện"
+        )
+
+@app.get("/chat/{conversation_id}", response_model=List[Dict[str, str]])
+async def get_chat_history(conversation_id: str):
+    """Lấy lịch sử cuộc trò chuyện"""
+    if conversation_id in conversation_histories:
+        # Return only user and assistant messages, not system messages
+        history = [
+            {"role": msg["role"], "content": msg["content"]} 
+            for msg in conversation_histories[conversation_id]
+            if msg["role"] != "system"
+        ]
+        return history
+    else:
+        raise HTTPException(
+            status_code=404,
+            detail="Không tìm thấy cuộc trò chuyện"
+        )
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
